@@ -23,6 +23,39 @@ def get_db_connection():
     return conn
 
 
+LIKED_SONGS_TITLE = 'Liked Songs'
+
+
+def fetch_playlist_tracks(conn, playlist_id):
+    return conn.execute('''
+        SELECT Track.TrackID as TrackID, Track.Title as Title, Artist.Name as ArtistName, Track.Genre as Genre
+        FROM Contains
+        JOIN Track ON Contains.TrackID = Track.TrackID
+        JOIN Artist ON Track.ArtistID = Artist.ArtistID
+        WHERE Contains.PlaylistID = ?
+        ORDER BY Track.Title COLLATE NOCASE ASC, Artist.Name COLLATE NOCASE ASC
+    ''', (playlist_id,)).fetchall()
+
+
+def ensure_liked_songs_playlist(conn, user_id):
+    playlist = conn.execute(
+        'SELECT PlaylistID, GeneratedTitle, DateCreated FROM Playlist WHERE UserID = ? AND GeneratedTitle = ? ORDER BY PlaylistID ASC LIMIT 1',
+        (user_id, LIKED_SONGS_TITLE)
+    ).fetchone()
+    if playlist:
+        return playlist
+
+    cursor = conn.execute(
+        'INSERT INTO Playlist (UserID, GeneratedTitle, DateCreated) VALUES (?, ?, ?)',
+        (user_id, LIKED_SONGS_TITLE, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    )
+    conn.commit()
+    return conn.execute(
+        'SELECT PlaylistID, GeneratedTitle, DateCreated FROM Playlist WHERE PlaylistID = ?',
+        (cursor.lastrowid,)
+    ).fetchone()
+
+
 def ensure_tables():
     """Create any tables that may not exist yet (e.g. on an older DB)."""
     conn = get_db_connection()
@@ -340,26 +373,30 @@ def library():
         return redirect(url_for('login'))
 
     conn = get_db_connection()
+    liked_playlist = ensure_liked_songs_playlist(conn, session['user_id'])
     playlists_data = conn.execute(
-        'SELECT * FROM Playlist WHERE UserID = ? ORDER BY DateCreated DESC',
-        (session['user_id'],)
+        'SELECT * FROM Playlist WHERE UserID = ? AND PlaylistID != ? ORDER BY DateCreated DESC',
+        (session['user_id'], liked_playlist['PlaylistID'])
     ).fetchall()
 
     playlists = []
     for p in playlists_data:
-        tracks = conn.execute('''
-            SELECT Track.TrackID as TrackID, Track.Title as Title, Artist.Name as ArtistName, Track.Genre as Genre
-            FROM Contains
-            JOIN Track ON Contains.TrackID = Track.TrackID
-            JOIN Artist ON Track.ArtistID = Artist.ArtistID
-            WHERE Contains.PlaylistID = ?
-        ''', (p['PlaylistID'],)).fetchall()
+        tracks = fetch_playlist_tracks(conn, p['PlaylistID'])
         playlists.append({
             'id': p['PlaylistID'],
             'title': p['GeneratedTitle'],
             'date': p['DateCreated'],
             'tracks': tracks
         })
+
+    liked_tracks = fetch_playlist_tracks(conn, liked_playlist['PlaylistID'])
+    songs_library = {
+        'id': liked_playlist['PlaylistID'],
+        'title': liked_playlist['GeneratedTitle'],
+        'date': liked_playlist['DateCreated'],
+        'tracks': liked_tracks
+    }
+
     player_playlists = [
         {
             'id': playlist['id'],
@@ -376,11 +413,25 @@ def library():
         }
         for playlist in playlists
     ]
+    player_playlists.append({
+        'id': songs_library['id'],
+        'title': songs_library['title'],
+        'tracks': [
+            {
+                'id': track['TrackID'],
+                'title': track['Title'],
+                'artist': track['ArtistName'],
+                'genre': track['Genre']
+            }
+            for track in songs_library['tracks']
+        ]
+    })
     notifications = build_user_notifications(conn, session['user_id'])
     conn.close()
     return render_template(
         'library.html',
         playlists=playlists,
+        songs_library=songs_library,
         player_playlists=player_playlists,
         notifications=notifications
     )
@@ -543,6 +594,16 @@ def _serialize_search_track(row):
     }
 
 
+def _serialize_search_artist(row):
+    return {
+        'id': row['ArtistID'],
+        'name': row['Name'],
+        'type': 'Artist',
+        'genre': '',
+        'artist': row['Name']
+    }
+
+
 def _build_search_recommendations(conn, query_text, matched_tracks, limit=5):
     lowered_query = (query_text or '').strip().lower()
     matched_ids = [row['TrackID'] for row in matched_tracks]
@@ -640,10 +701,53 @@ def api_search():
     ).fetchall()
     recommendations = _build_search_recommendations(conn, q, tracks)
     conn.close()
-    results = [{'id': r['ArtistID'], 'name': r['Name'], 'type': 'Artist',
-                'genre': '', 'artist': r['Name']} for r in artists]
+    results = [_serialize_search_artist(r) for r in artists]
     results += [_serialize_search_track(r) for r in tracks]
     return jsonify({'results': results, 'recommendations': recommendations})
+
+
+@app.route('/api/search/artist')
+def api_search_artist():
+    if 'user_id' not in session:
+        return jsonify({'artist': None, 'tracks': []})
+
+    artist_id = request.args.get('artist_id', type=int)
+    artist_name = request.args.get('name', '').strip()
+
+    if not artist_id and not artist_name:
+        return jsonify({'artist': None, 'tracks': []})
+
+    conn = get_db_connection()
+    artist = None
+    if artist_id:
+        artist = conn.execute(
+            'SELECT ArtistID, Name FROM Artist WHERE ArtistID = ?',
+            (artist_id,)
+        ).fetchone()
+
+    if not artist and artist_name:
+        artist = conn.execute(
+            'SELECT ArtistID, Name FROM Artist WHERE LOWER(Name) = LOWER(?) OR Name LIKE ? ORDER BY CASE WHEN LOWER(Name) = LOWER(?) THEN 0 ELSE 1 END, Name ASC LIMIT 1',
+            (artist_name, '%' + artist_name + '%', artist_name)
+        ).fetchone()
+
+    if not artist:
+        conn.close()
+        return jsonify({'artist': None, 'tracks': []})
+
+    tracks = conn.execute('''
+        SELECT Track.TrackID, Track.Title, Track.Genre, Artist.Name as ArtistName
+        FROM Track
+        JOIN Artist ON Track.ArtistID = Artist.ArtistID
+        WHERE Artist.ArtistID = ?
+        ORDER BY Track.PlayCount DESC, Track.Title COLLATE NOCASE ASC
+    ''', (artist['ArtistID'],)).fetchall()
+    conn.close()
+
+    return jsonify({
+        'artist': _serialize_search_artist(artist),
+        'tracks': [_serialize_search_track(row) for row in tracks]
+    })
 
 
 @app.route('/api/search_history', methods=['GET'])
